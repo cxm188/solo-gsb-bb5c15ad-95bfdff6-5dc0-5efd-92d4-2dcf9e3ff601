@@ -13,6 +13,7 @@ from fastapi import HTTPException
 from .cursor import decode_cursor, encode_cursor
 from .db import read_tx, write_tx
 from .schemas import (
+    CompareIntervalOut,
     EffectiveEvent,
     EventBatchIn,
     EventChangeOut,
@@ -24,6 +25,7 @@ from .schemas import (
     LeaderboardEntry,
     LeaderboardOut,
     LeaderboardPageOut,
+    ParticipantCompareOut,
     RankPosition,
     ScoreBreakdownOut,
     ScoreContribution,
@@ -648,4 +650,108 @@ def score_breakdown(
     total = sum(c.effective_event.points for c in contributions)
     return ScoreBreakdownOut(
         revision=revision, total_points=total, contributions=contributions
+    )
+
+
+def participant_compare(
+    left_id: str, right_id: str, from_revision: int, to_revision: int
+) -> ParticipantCompareOut:
+    """Per-revision score race between two participants, merged into intervals.
+
+    For every revision R in ``[from_revision, to_revision]`` both sides'
+    effective totals are computed under the same rule as ``/leaderboard``:
+    an event counts iff it exists at R and no correction existing at R
+    supersedes it. Rather than re-running the snapshot query per revision,
+    events are replayed once in revision order: an event becomes effective
+    the moment it is written (corrections always carry larger revisions) and
+    stops being effective at its *first* direct correction — so a correction
+    that re-attributes an event from participant A to B subtracts from A and
+    adds to B at the correction's own revision. Consecutive snapshots with
+    identical totals on both sides merge into one closed interval.
+
+    Validation order matches ``/leaderboard/changes``: ordering errors are
+    422, a ``to_revision`` beyond the current maximum is 404.
+    ``from_revision == 0`` denotes the empty ledger; unknown participants
+    simply stay at 0, so two scoreless sides yield a single ``tie``
+    interval covering the whole range.
+    """
+    if from_revision < 0 or from_revision > to_revision:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "require 0 <= from_revision <= to_revision, got "
+                f"from_revision={from_revision}, to_revision={to_revision}"
+            ),
+        )
+
+    with read_tx() as conn:
+        max_rev = conn.execute(
+            "SELECT COALESCE(MAX(revision), 0) FROM events"
+        ).fetchone()[0]
+        if to_revision > max_rev:
+            raise HTTPException(
+                status_code=404, detail=f"revision {to_revision} not found"
+            )
+        rows = conn.execute(
+            "SELECT event_id, participant_id, points, correction_of, revision"
+            " FROM events WHERE revision <= ? ORDER BY revision ASC",
+            (to_revision,),
+        ).fetchall()
+
+    by_revision: dict[int, list[sqlite3.Row]] = {}
+    for r in rows:
+        by_revision.setdefault(r["revision"], []).append(r)
+
+    points_by_id: dict[str, Tuple[str, int]] = {}
+    superseded: set[str] = set()
+    left_total = right_total = 0
+    intervals: list[CompareIntervalOut] = []
+    for rev in range(0, to_revision + 1):
+        for r in by_revision.get(rev, ()):
+            pid = r["participant_id"]
+            if pid == left_id:
+                left_total += r["points"]
+            if pid == right_id:
+                right_total += r["points"]
+            points_by_id[r["event_id"]] = (pid, r["points"])
+            target = r["correction_of"]
+            if target is not None and target not in superseded:
+                # First correction of ``target``: it stops being effective at
+                # this revision, so its points leave the old owner's total.
+                superseded.add(target)
+                t_pid, t_points = points_by_id[target]
+                if t_pid == left_id:
+                    left_total -= t_points
+                if t_pid == right_id:
+                    right_total -= t_points
+        if rev < from_revision:
+            continue
+        if (
+            intervals
+            and intervals[-1].left_points == left_total
+            and intervals[-1].right_points == right_total
+        ):
+            intervals[-1].end_revision = rev
+            continue
+        if left_total > right_total:
+            leader = "left"
+        elif right_total > left_total:
+            leader = "right"
+        else:
+            leader = "tie"
+        intervals.append(
+            CompareIntervalOut(
+                start_revision=rev,
+                end_revision=rev,
+                left_points=left_total,
+                right_points=right_total,
+                leader=leader,
+            )
+        )
+    return ParticipantCompareOut(
+        left_id=left_id,
+        right_id=right_id,
+        from_revision=from_revision,
+        to_revision=to_revision,
+        intervals=intervals,
     )

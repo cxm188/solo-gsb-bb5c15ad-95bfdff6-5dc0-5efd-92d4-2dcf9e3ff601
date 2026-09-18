@@ -153,3 +153,26 @@ class ScoreBreakdownOut(BaseModel):
     revision: int
     total_points: int
     contributions: List[ScoreContribution]
+
+
+class CompareIntervalOut(BaseModel):
+    """One closed revision interval where both sides' totals stay constant."""
+
+    start_revision: int
+    end_revision: int
+    left_points: int = Field(description="Effective total of ``left_id`` on this interval.")
+    right_points: int = Field(description="Effective total of ``right_id`` on this interval.")
+    leader: Literal["left", "right", "tie"] = Field(
+        description=(
+            "left: left_points > right_points; right: right_points > left_points; "
+            "tie: equal totals (including both zero)."
+        )
+    )
+
+
+class ParticipantCompareOut(BaseModel):
+    left_id: str
+    right_id: str
+    from_revision: int
+    to_revision: int
+    intervals: List[CompareIntervalOut]
