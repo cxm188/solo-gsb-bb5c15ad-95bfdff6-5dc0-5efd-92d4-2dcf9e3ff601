@@ -15,6 +15,7 @@ from .schemas import (
     LeaderboardChangesOut,
     LeaderboardOut,
     LeaderboardPageOut,
+    ParticipantCompareOut,
     ScoreBreakdownOut,
 )
 
@@ -174,6 +175,31 @@ def get_leaderboard_page(
     ),
 ) -> LeaderboardPageOut:
     return ledger.leaderboard_page(revision, limit, cursor)
+
+
+# NOTE: declared before /participants/{participant_id}/... so the literal path wins.
+@app.get(
+    "/participants/compare",
+    response_model=ParticipantCompareOut,
+    responses={
+        404: {"description": "to_revision beyond the current maximum"},
+        422: {"description": "Missing/non-integer params, or invalid revision ordering"},
+    },
+)
+def get_participants_compare(
+    left_id: str = Query(description="Participant id on the left side of the comparison."),
+    right_id: str = Query(description="Participant id on the right side of the comparison."),
+    from_revision: int = Query(
+        description="Earlier revision; 0 means the empty ledger; may equal to_revision.",
+        ge=0,
+    ),
+    to_revision: int = Query(
+        description="Later revision; must not be smaller than from_revision or "
+        "beyond the current maximum.",
+        ge=0,
+    ),
+) -> ParticipantCompareOut:
+    return ledger.compare_participants(left_id, right_id, from_revision, to_revision)
 
 
 @app.get(

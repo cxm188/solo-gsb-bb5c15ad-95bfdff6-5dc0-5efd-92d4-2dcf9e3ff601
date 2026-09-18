@@ -153,3 +153,21 @@ class ScoreBreakdownOut(BaseModel):
     revision: int
     total_points: int
     contributions: List[ScoreContribution]
+
+
+class ParticipantCompareIntervalOut(BaseModel):
+    """Maximal closed revision range with unchanged totals for both sides."""
+
+    start_revision: int
+    end_revision: int
+    left_score: int
+    right_score: int
+    leader: Literal["left", "right", "tie"]
+
+
+class ParticipantCompareOut(BaseModel):
+    left_id: str
+    right_id: str
+    from_revision: int
+    to_revision: int
+    intervals: List[ParticipantCompareIntervalOut]

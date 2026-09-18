@@ -276,6 +276,54 @@ curl 'localhost:8000/events/changes?from_revision=1&to_revision=2'
 }
 ```
 
+### 双方对比 `GET /participants/compare`
+
+按每个 revision 快照计算两个参赛者的**有效总分**，把连续且双方分数均不变的快照合并成闭区间，输出每个区间的领先方。四个查询参数均**必填**：
+
+| 查询参数 | 说明 |
+|---|---|
+| `left_id` | 左侧参赛者 ID |
+| `right_id` | 右侧参赛者 ID |
+| `from_revision` | 起点 revision，允许传 `0` 表示空账本；须满足 `0 ≤ from_revision ≤ to_revision`（允许等于） |
+| `to_revision` | 终点 revision，须满足 `to_revision ≤ 当前 revision` |
+
+- 逐个 revision 重放快照：生效规则与排行榜一致（每条更正链只计当时的末端事件，链分叉后多个末端同时有效）；
+- 更正把事件从一方改挂到另一方时，在**该更正 revision 同一个快照**中同时体现原归属方扣分与新归属方加分；
+- 相邻 revision 若双方总分（`left_score`、`right_score`）均相同则合并为一个闭区间，区间含 `start_revision`、`end_revision`、`left_score`、`right_score` 与 `leader`（`left` / `right` / `tie`）；
+- 区间始终首尾相接、完整覆盖查询范围；即使双方在整个范围内都无分（含未知参赛者、空账本），也返回一个覆盖全范围的 `tie` 区间——未知参赛者**不报错**，按全程 0 分处理；
+- 顺序非法（缺参/非整数/负数、`from_revision > to_revision`）返回 `422`，`to_revision` 超出当前 revision 返回 `404`（校验顺序：先 422 后 404）。
+
+```bash
+# alice 先得 10 分（rev1），随后一次更正把该事件改挂给 bob（rev2）
+curl -X POST localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"event_id":"e1","participant_id":"alice","points":10}'
+curl -X POST localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"event_id":"e2","participant_id":"bob","points":10,"correction_of":"e1"}'
+
+curl 'localhost:8000/participants/compare?left_id=alice&right_id=bob&from_revision=0&to_revision=2'
+```
+
+```json
+{
+  "left_id": "alice",
+  "right_id": "bob",
+  "from_revision": 0,
+  "to_revision": 2,
+  "intervals": [
+    {"start_revision": 0, "end_revision": 0, "left_score": 0,  "right_score": 0,  "leader": "tie"},
+    {"start_revision": 1, "end_revision": 1, "left_score": 10, "right_score": 0,  "leader": "left"},
+    {"start_revision": 2, "end_revision": 2, "left_score": 0,  "right_score": 10, "leader": "right"}
+  ]
+}
+```
+
+revision 2 的同一快照中，alice 被扣掉 10 分、bob 被加上 10 分。双方分数都不变的相邻快照会被合并，例如两人在 revision 2–4 始终为 10:10，则对应区间为 `{"start_revision": 2, "end_revision": 4, ...}`。查询未知参赛者（或双方都无分）时也不报错：
+
+```bash
+curl 'localhost:8000/participants/compare?left_id=ghost-a&right_id=ghost-b&from_revision=0&to_revision=2'
+# intervals: [{"start_revision": 0, "end_revision": 2, "left_score": 0, "right_score": 0, "leader": "tie"}]
+```
+
 ### 积分归因 `GET /participants/{participant_id}/score-breakdown`
 
 按更正链拆解某个参赛者在指定快照上的积分来源。
@@ -344,7 +392,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 pytest -v
 ```
 
-测试覆盖：幂等重放、409 冲突、更正链末端计数、历史 revision 查询、排行榜排序、50 路并发写入下 revision 唯一且连续，`/leaderboard/page` 游标分页（快照固定、并发续读、篡改/冲突返回 422、末页与空榜），`/leaderboard/changes`（空榜对比、仅名次变化、更正链 A 退出/B 进入、参数顺序 422、超范围 404、按 `participant_id` 排序），`/events/changes`（空账本对比、更正合并为 `replaced`、链分叉记 `added`、非一进一出不合并、before/after 完整事件、按链根排序、参数顺序 422、超范围 404、路由不被 `/events/{event_id}` 遮蔽），`/events/batch`（连续 revision 与同序响应、批内唯一、引用更早项/后续项/未知项、全量重放 200、部分重放与异载荷 409、失败整批回滚不耗 revision、批量并发下 revision 块连续），以及 `/participants/{participant_id}/score-breakdown`（空账本与未知参赛者返回 0 与空数组、更正链只计末端且 history 完整、历史 revision 固定快照、revision 0 空快照、更正转移后旧参赛者不再保留该链而新归属者 history 展示此前归属、按链根升序、分叉链每末端各成一项、总分与 `/leaderboard` 一致、默认取当前 revision、负数 422、超范围 404）。
+测试覆盖：幂等重放、409 冲突、更正链末端计数、历史 revision 查询、排行榜排序、50 路并发写入下 revision 唯一且连续，`/leaderboard/page` 游标分页（快照固定、并发续读、篡改/冲突返回 422、末页与空榜），`/leaderboard/changes`（空榜对比、仅名次变化、更正链 A 退出/B 进入、参数顺序 422、超范围 404、按 `participant_id` 排序），`/events/changes`（空账本对比、更正合并为 `replaced`、链分叉记 `added`、非一进一出不合并、before/after 完整事件、按链根排序、参数顺序 422、超范围 404、路由不被 `/events/{event_id}` 遮蔽），`/events/batch`（连续 revision 与同序响应、批内唯一、引用更早项/后续项/未知项、全量重放 200、部分重放与异载荷 409、失败整批回滚不耗 revision、批量并发下 revision 块连续），以及 `/participants/{participant_id}/score-breakdown`（空账本与未知参赛者返回 0 与空数组、更正链只计末端且 history 完整、历史 revision 固定快照、revision 0 空快照、更正转移后旧参赛者不再保留该链而新归属者 history 展示此前归属、按链根升序、分叉链每末端各成一项、总分与 `/leaderboard` 一致、默认取当前 revision、负数 422、超范围 404），以及 `/participants/compare`（从 0 起逐快照合并区间、区间连续覆盖整段查询、`from_revision = to_revision` 单点区间、双方始终无分与未知参赛者返回覆盖全范围的 tie、改挂更正同 revision 扣分+加分、链分叉多末端、相同 ID 恒为 tie、负分、缺参/非整数/负数/顺序颠倒 422、超范围 404 且顺序校验优先、路由不被 `/participants/{participant_id}/score-breakdown` 遮蔽）。
 
 ## 设计要点
 
@@ -354,5 +402,6 @@ pytest -v
 - **生效判定**：revision R 上事件 e 生效 ⟺ `e.revision ≤ R` 且不存在 `c.revision ≤ R` 的更正事件 `c.correction_of = e.event_id`。
 - **事件差异**：`/events/changes` 复用同一生效判定取两个快照的生效事件，沿 `correction_of` 上溯到链根后按链根归组；同链根下相同 `event_id` 抵消，剩余一进一出合并为 `replaced`，否则逐项记 `added`/`removed`，按 `(chain_root, after/before 的 revision, event_id)` 排序。
 - **积分归因**：`/participants/{participant_id}/score-breakdown` 在单个读快照内取 `revision ≤ R` 的全部事件，未被更正的事件即各链生效末端；属于目标参赛者的末端沿 `correction_of` 上溯到链根，生成 `(chain_root, effective_event, history)` 三元组，按链根 `event_id` 升序输出；`total_points` 为各生效末端积分之和，与 `/leaderboard` 同 revision 的总分一致。
+- **双方对比**：`/participants/compare` 在单个读快照内按 revision 升序重放事件，维护各链当前生效末端（分叉时一个链根可持有多个末端）与双方累计总分；改挂更正先弹出旧末端（原归属方扣分）再挂上新末端（新归属方加分），两个调整落在同一 revision。逐快照记录 `(left_score, right_score)` 后将相邻完全相同的快照合并为闭区间并标注 `leader`；区间首尾相接完整覆盖 `[from_revision, to_revision]`，未知参赛者全程按 0 分处理。
 - **并发**：所有写操作在 `BEGIN IMMEDIATE` 事务内先取写锁、再计算 `MAX(revision)+1` 并插入（批量为一段连续块），配合 `busy_timeout`，写者完全串行；读者走 WAL 快照，互不阻塞。
 - **游标分页**：`/leaderboard/page` 的游标经 HMAC-SHA256 签名（密钥来自 `LEADERBOARD_CURSOR_SECRET`），绑定 revision 与末条排序键 `(total_points, participant_id)`；续读始终落在游标指定的 revision 上，配合 WAL 快照读，写入并发进行也不会造成分页漂移。

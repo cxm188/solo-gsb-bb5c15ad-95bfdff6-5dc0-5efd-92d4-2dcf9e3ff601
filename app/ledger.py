@@ -24,6 +24,8 @@ from .schemas import (
     LeaderboardEntry,
     LeaderboardOut,
     LeaderboardPageOut,
+    ParticipantCompareIntervalOut,
+    ParticipantCompareOut,
     RankPosition,
     ScoreBreakdownOut,
     ScoreContribution,
@@ -648,4 +650,118 @@ def score_breakdown(
     total = sum(c.effective_event.points for c in contributions)
     return ScoreBreakdownOut(
         revision=revision, total_points=total, contributions=contributions
+    )
+
+
+def compare_participants(
+    left_id: str, right_id: str, from_revision: int, to_revision: int
+) -> ParticipantCompareOut:
+    """Effective-total comparison of two participants over a revision range.
+
+    Snapshots are replayed revision by revision in a single pass: every
+    correction chain carries at most one effective tip per participant at a
+    time (a correction of an already-superseded event forks the chain, so one
+    root may carry several tips belonging to different participants), which
+    mirrors the effective-event rule used by ``/leaderboard``. In particular,
+    a correction re-attributing a chain tip from A to B adjusts both totals at
+    the correction's own revision: A is debited and B is credited together.
+
+    Consecutive revisions whose ``(left_total, right_total)`` pair is
+    identical are merged into one closed ``[start_revision, end_revision]``
+    interval. ``from_revision == to_revision`` is legal and yields a single
+    point interval. Unknown participants are simply treated as scoreless
+    throughout, so the result still covers the whole query range (a single
+    tie interval when neither ever scores).
+
+    Validation order matches the other ranged endpoints: ordering errors are
+    422; ``to_revision`` beyond the current maximum is 404.
+    """
+    if from_revision < 0 or from_revision > to_revision:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "require 0 <= from_revision <= to_revision, got "
+                f"from_revision={from_revision}, to_revision={to_revision}"
+            ),
+        )
+
+    with read_tx() as conn:
+        max_rev = conn.execute(
+            "SELECT COALESCE(MAX(revision), 0) FROM events"
+        ).fetchone()[0]
+        if to_revision > max_rev:
+            raise HTTPException(
+                status_code=404, detail=f"revision {to_revision} not found"
+            )
+        rows = conn.execute(
+            "SELECT event_id, participant_id, points, revision, correction_of"
+            " FROM events WHERE revision <= ? ORDER BY revision ASC",
+            (to_revision,),
+        ).fetchall()
+
+    # effective[event_id] = (participant_id, points) for current chain tips;
+    # one chain root may hold several tips after a fork.
+    effective: dict[str, Tuple[str, int]] = {}
+    totals: dict[str, int] = {}
+    snapshots: list[Tuple[int, int]] = []
+    if from_revision == 0:
+        snapshots.append((0, 0))
+
+    for r in rows:
+        new_pid, points, target = r["participant_id"], r["points"], r["correction_of"]
+        if target is not None:
+            old = effective.pop(target, None)
+            if old is not None:
+                old_pid, old_points = old
+                totals[old_pid] = totals.get(old_pid, 0) - old_points
+                if totals[old_pid] == 0:
+                    del totals[old_pid]
+        effective[r["event_id"]] = (new_pid, points)
+        totals[new_pid] = totals.get(new_pid, 0) + points
+
+        revision = r["revision"]
+        if revision >= from_revision:
+            snapshots.append((totals.get(left_id, 0), totals.get(right_id, 0)))
+
+    intervals: list[ParticipantCompareIntervalOut] = []
+    start = from_revision
+    prev: Optional[Tuple[int, int]] = None
+    for i, (left_score, right_score) in enumerate(snapshots):
+        revision = from_revision + i
+        if left_score > right_score:
+            leader = "left"
+        elif right_score > left_score:
+            leader = "right"
+        else:
+            leader = "tie"
+        if prev is None:
+            prev = (left_score, right_score, leader)
+        elif (left_score, right_score, leader) != prev:
+            intervals.append(
+                ParticipantCompareIntervalOut(
+                    start_revision=start,
+                    end_revision=revision - 1,
+                    left_score=prev[0],
+                    right_score=prev[1],
+                    leader=prev[2],
+                )
+            )
+            start = revision
+            prev = (left_score, right_score, leader)
+    intervals.append(
+        ParticipantCompareIntervalOut(
+            start_revision=start,
+            end_revision=to_revision,
+            left_score=prev[0],
+            right_score=prev[1],
+            leader=prev[2],
+        )
+    )
+
+    return ParticipantCompareOut(
+        left_id=left_id,
+        right_id=right_id,
+        from_revision=from_revision,
+        to_revision=to_revision,
+        intervals=intervals,
     )
